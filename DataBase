@@ -1,0 +1,145 @@
+--// GameData
+local GameData = game:GetService("DataStoreService"):GetDataStore("535")
+
+--// services
+local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// remotes
+local UpdateDataAsync = ReplicatedStorage.Remotes.UpdateDataAsync
+
+--// class
+local module = {}
+module.__index = module
+
+function module.new(player: Player): {}
+	local self = setmetatable({
+		_player = player,
+		_threads = {},
+		
+		_minuteMultipliers = 0
+	}, module)
+
+	self._dataId = tostring(player.UserId)
+
+	self:_getData()
+	self:_minutesCounter()
+
+	return self	
+end
+
+function module:AddPurchases(value: number): ()
+	self._data.Purchases += value	
+
+	self._folder["🛒 Purchases"].Value = self._data.Purchases
+end
+
+function module:AddHearts(value: number): ()
+	self._data.Hearts2 = self._data.Hearts2 + value
+	self._heartsValue.Value = self._data.Hearts2
+
+	UpdateDataAsync:FireClient(self._player, nil, "UpdateHearts", self._data.Hearts2)
+end
+
+function module:AddDonation(value: number): ()
+	self._data.Donations += value	
+	UpdateDataAsync:FireClient(self._player, nil, "UpdateDonations", self._data.Donations)
+end
+
+function module:AddMinutes(value: number): ()
+	self._data.Minutes += value
+	self._folder["🧭 Minutes"].Value = self._data.Minutes
+	
+	UpdateDataAsync:FireClient(self._player, nil, "UpdateMinutes", self._data.Minutes)
+end
+
+function module:GetValue(attribute: string): any
+	return self._data[attribute]
+end
+
+function module:_minutesCounter(): ()	
+	self._threads.CounterTask = coroutine.create(function()
+		while task.wait(60) do
+			self:AddMinutes(math.max(1, 1 * self._minuteMultipliers))
+			self:AddHearts(10)
+		end
+	end)
+	coroutine.resume(self._threads.CounterTask)
+end
+
+function module:_getData(): ()	
+	local playerData
+	
+	for attemps = 1, 5 do
+		local sucess, data = pcall(GameData.GetAsync, GameData, self._dataId)
+		if sucess then 		
+			playerData = data
+			break
+		end
+				
+		task.wait(7)	
+	end
+	
+	local dataTemplate = {Hearts2 = 0, Minutes = 0, Purchases = 0, Donations = 0}
+	if playerData then
+		for k, v in dataTemplate do
+			if playerData[k] then continue end
+			playerData[k] = v
+		end
+	else
+		playerData = dataTemplate
+	end
+	
+	self._data = playerData
+	
+	self:_convertToFolders()
+end
+
+function module:_convertToFolders(): ()
+	self._folder = Instance.new("Folder")
+	self._folder.Name = "leaderstats"
+	
+	local minutes = Instance.new("IntValue")
+	minutes.Name = "🧭 Minutes"
+	minutes.Value = self:GetValue("Minutes")
+	minutes.Parent = self._folder
+
+	local purchases = Instance.new("IntValue")
+	purchases.Name = "🛒 Purchases"
+	purchases.Value = self:GetValue("Purchases")
+	purchases.Parent = self._folder
+	
+	self._heartsValue = Instance.new("IntValue")
+	self._heartsValue.Name = "♥ Hearts"
+	self._heartsValue.Value = self:GetValue("Hearts2")
+	self._heartsValue.Parent = self._folder
+	
+	self._folder.Parent = self._player
+end
+
+function module:_saveData(): ()	
+	for attemps = 1, 5 do
+		local sucess = pcall(GameData.SetAsync, GameData,
+			self._dataId, self._data)
+		
+		if sucess then break end
+		
+		task.wait(7)
+	end
+end
+
+function module:Remove(): ()
+	for _, thread in self._threads do coroutine.close(thread)end
+	
+	self:_saveData()
+	
+	self._folder:Destroy()
+	
+	setmetatable(self, nil)
+	table.clear(self)
+	table.freeze(self)
+	
+	self = nil
+end
+
+return module
