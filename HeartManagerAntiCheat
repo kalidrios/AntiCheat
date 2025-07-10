@@ -1,0 +1,187 @@
+-- HeartManagerAntiCheat.lua: coleta, anti-cheat, spawn, compras e sincronização de corações
+
+local RunService        = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HeartControl      = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("HeartControl")
+local ServerData        = require(script.Parent.ServerData)
+
+-- Configurações
+local HEARTS_PER_AREA         = 2
+local HEART_DESPAWN_TIME      = 30
+local PLAYER_COLLECT_COOLDOWN = 0.7
+local MAX_SPEED               = 25
+local COLLECT_RADIUS          = 4
+local SYNC_COOLDOWN           = 5
+local MAX_HEARTS_ON_MAP       = HEARTS_PER_AREA * #workspace:WaitForChild("HeartsSpawns"):GetChildren()
+
+-- Estado
+local areas              = {}
+local heartsCache        = {} -- [heartId] = { pos=Vector3, area=areaName, spawned=timestamp }
+local playerDebounce     = {} -- [player] = timestamp
+local lastCollectState   = {} -- [player] = { lastPos=Vector3, lastTime=timestamp }
+local antiCheatLogs      = {} -- [player] = { timestamps }
+local lastSyncRequest    = {} -- [player] = timestamp
+local collectedThisFrame = {} -- [heartId] = true
+
+-- Utilitário: log de suspeitas
+local function logSuspect(reason, player, extra)
+	warn(string.format("[HEART ANTI-CHEAT] %s | Player: %s | %s", reason, player and player.Name or "Unknown", extra or ""))
+end
+
+-- Inicialização das áreas (nomeadas por índice)
+for i, areaPart in ipairs(workspace:WaitForChild("HeartsSpawns"):GetChildren()) do
+	local name = tostring(i)
+	areaPart.Name = name
+	areas[name] = { Name = name, Hearts = 0, Ref = areaPart }
+end
+
+local function getAvailableArea()
+	for _, area in pairs(areas) do
+		if area.Hearts < HEARTS_PER_AREA then
+			return area
+		end
+	end
+end
+
+local function getRandomPoint()
+	local area = getAvailableArea()
+	if not area then return end
+	local ref = area.Ref
+	local halfX, halfZ = ref.Size.X/2, ref.Size.Z/2
+	local x = math.floor(math.random(ref.Position.X - halfX, ref.Position.X + halfX)/8) * 8
+	local z = math.floor(math.random(ref.Position.Z - halfZ, ref.Position.Z + halfZ)/8) * 8
+	return Vector3.new(x, ref.Position.Y + 2, z), area.Name
+end
+
+local function despawnHeart(heartId)
+	local heart = heartsCache[heartId]
+	if not heart then return end
+	areas[heart.area].Hearts -= 1
+	heartsCache[heartId] = nil
+	collectedThisFrame[heartId] = nil
+	HeartControl:FireAllClients(2, heartId)
+end
+
+-- Anti-cheat (taxa, cooldown e speedhack)
+local function antiCheatCheck(player, collectPos)
+	local now = os.clock()
+	antiCheatLogs[player] = antiCheatLogs[player] or {}
+	local log = antiCheatLogs[player]
+	table.insert(log, now)
+	for i = #log, 1, -1 do
+		if now - log[i] > 2 then table.remove(log, i) end
+	end
+
+	if #log > 5 then
+		logSuspect("Coleta muito rápida", player, string.format("Qtd: %d em 2s", #log))
+		return "fast"
+	end
+
+	if playerDebounce[player] and now - playerDebounce[player] < PLAYER_COLLECT_COOLDOWN then
+		logSuspect("Cooldown de coleta", player)
+		return "cooldown"
+	end
+
+	local last = lastCollectState[player]
+	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	local curPos = hrp and hrp.Position or collectPos
+	if last then
+		local dt = now - last.lastTime
+		if dt > 0 then
+			local dist = (curPos - last.lastPos).Magnitude
+			local speed = dist / dt
+			if speed > MAX_SPEED then
+				logSuspect("Velocidade suspeita", player, string.format("%.1f studs/s", speed))
+				return "speed"
+			end
+		end
+	end
+
+	lastCollectState[player] = { lastPos = curPos, lastTime = now }
+	playerDebounce[player] = now
+	return nil
+end
+
+-- Tenta coletar um coração
+local function tryCollectHeart(heartId, player)
+	local heart = heartsCache[heartId]
+	if not heart or collectedThisFrame[heartId] then return end
+
+	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp or (hrp.Position - heart.pos).Magnitude > COLLECT_RADIUS then return end
+
+	collectedThisFrame[heartId] = true
+	local anti = antiCheatCheck(player, heart.pos)
+	if anti == "fast" or anti == "speed" then
+		local session = ServerData.GetData(player)
+		if session then session:AddHearts(-1, "penalty") end
+		despawnHeart(heartId)
+		return
+	elseif anti == "cooldown" then
+		collectedThisFrame[heartId] = nil
+		return
+	end
+
+	local session = ServerData.GetData(player)
+	if session then session:AddHearts(1, "collect") end
+	despawnHeart(heartId)
+	task.delay(math.random(4, 8), function()
+		newHeart()
+	end)
+end
+
+-- Spawn de novo coração
+function newHeart()
+	local pos, areaName = getRandomPoint()
+	if not pos then return end
+	local id = tostring({})
+	heartsCache[id] = { pos = pos, area = areaName, spawned = os.clock() }
+	areas[areaName].Hearts += 1
+	HeartControl:FireAllClients(1, id, pos)
+end
+
+-- Loop global para despawn e coleta
+RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	collectedThisFrame = {}
+	for heartId, heart in pairs(heartsCache) do
+		if now - heart.spawned >= HEART_DESPAWN_TIME then
+			despawnHeart(heartId)
+		else
+			for _, plr in ipairs(Players:GetPlayers()) do
+				tryCollectHeart(heartId, plr)
+			end
+		end
+	end
+end)
+
+-- Sincronização remota
+HeartControl.OnServerEvent:Connect(function(plr, opcode)
+	if typeof(opcode) ~= "number" then return end
+	if opcode == 3 then
+		local now = os.clock()
+		if lastSyncRequest[plr] and now - lastSyncRequest[plr] < SYNC_COOLDOWN then return end
+		lastSyncRequest[plr] = now
+		HeartControl:FireClient(plr, 3, heartsCache)
+	elseif opcode == 4 then
+		HeartControl:FireAllClients(4, heartsCache)
+	else
+		logSuspect("Opcode inválido recebido", plr, tostring(opcode))
+	end
+end)
+
+-- Inicialização
+local module = {}
+function module.init()
+	for i = 1, MAX_HEARTS_ON_MAP do
+		newHeart()
+	end
+	Players.PlayerRemoving:Connect(function(plr)
+		playerDebounce[plr]        = nil
+		lastCollectState[plr]      = nil
+		antiCheatLogs[plr]         = nil
+		lastSyncRequest[plr]       = nil
+	end)
+end
+return module
