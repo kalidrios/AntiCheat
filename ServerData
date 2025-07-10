@@ -1,0 +1,73 @@
+--// services
+local ServerScriptService = game:GetService("ServerScriptService")
+local Players = game:GetService("Players")
+
+--// modules
+local DataBase = require(script.DataBase)
+
+--// service
+local module = {}
+local cache = {}
+
+local function onPlayerRemoving(player: Player): ()
+	local playerData = cache[player.Name]
+	if not playerData then return end
+	
+	playerData:Remove()
+	cache[player.Name] = nil
+end
+
+local function onPlayerAdded(player: Player): ()
+	cache[player.Name] = DataBase.new(player)
+end
+
+function module.AwaitForData(player: Player): {}?
+	local playerData = cache[player.Name]
+	
+	repeat task.wait()
+		playerData = cache[player.Name]
+	until player == nil or playerData ~= nil	
+	
+	return playerData
+end
+
+function module.GetData(player: Player?, filter: {}?, deserealized: boolean?): {}?
+	if filter and type(filter) ~= "table" then return end
+
+	local playerData = cache[player.Name]
+
+	if not playerData then playerData = module.AwaitForData(player) end
+	if not playerData then return end
+	
+	if not filter and not deserealized then return playerData end
+	if not filter and deserealized then return playerData._data end
+	if not filter then return end
+
+	local filteredData = {}
+	for _, attributeName in filter do
+		local value = playerData:GetValue(attributeName)
+		filteredData[attributeName] = value
+	end
+
+	return filteredData
+end
+
+module.callbacks = {
+	GetData = module.GetData
+}
+
+function module.init(): ()	
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+	for _, player in Players:GetPlayers() do
+		task.defer(onPlayerAdded, player)
+	end
+	Players.PlayerAdded:Connect(onPlayerAdded)
+
+	game:BindToClose(function()
+		for _, player in Players:GetPlayers() do
+			task.defer(onPlayerRemoving, player)
+		end
+	end)
+end
+
+return module
